@@ -36,7 +36,7 @@ except ImportError:
 
 
 # ============================================================
-# TOUPricing  
+# TOUPricing  (عین کد مرجع)
 # ============================================================
 @dataclass
 class TOUPricing:
@@ -64,7 +64,7 @@ class TOUPricing:
 
 
 # ============================================================
-# SystemConfig  
+# SystemConfig  (عین کد مرجع)
 # ============================================================
 @dataclass
 class SystemConfig:
@@ -109,26 +109,24 @@ class SystemConfig:
 
 
 # ============================================================
-# PPO: Actor-Critic Network  
+# PPO: Actor-Critic Network  (جدید - RL)
 # ============================================================
 class ActorCritic(nn.Module):
-    """
-    state: [co2_norm, occ_norm, hour_sin, hour_cos, T_norm, is_occ, vf_prev]
-    action: vent_factor ∈ [PI_VF_MIN, PI_VF_MAX]
-    """
     def __init__(self, state_dim: int = 7, hidden: int = 128):
         super().__init__()
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden),    nn.Tanh(),
+            nn.Linear(state_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden),    nn.ReLU(),
         )
         self.actor_mean    = nn.Linear(hidden, 1)
-        self.actor_log_std = nn.Parameter(torch.zeros(1))
+        self.actor_log_std = nn.Parameter(torch.ones(1) * -0.5) 
         self.critic        = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor):
         h    = self.shared(x)
-        mean = torch.sigmoid(self.actor_mean(h)) * 1.9 + 0.1   # → [0.1, 2.0]
+        # استفاده از Tanh برای محدودسازی ایمن در بازه [0, 2]
+        # در ابتدا Tanh(0) = 0 است، پس mean از 1.0 شروع می‌شود
+        mean = torch.tanh(self.actor_mean(h)) + 1.0 
         std  = self.actor_log_std.exp().expand_as(mean)
         val  = self.critic(h)
         return mean, std, val
@@ -138,13 +136,13 @@ class ActorCritic(nn.Module):
         with torch.no_grad():
             mean, std, val = self(x)
         dist   = torch.distributions.Normal(mean, std)
-        action = dist.sample().clamp(0.1, 2.0)
+        action = dist.sample()
         return action.item(), dist.log_prob(action).sum().item(), val.item()
-
-
+    
 # ============================================================
 # Classroom Environment  (جدید - RL)
 # همان فرمول CO2 mass-balance عین simulate_co2_series
+# همان Q mapping عین کد مرجع
 # ============================================================
 class ClassroomEnv:
     def __init__(self, occ_people: pd.Series, outdoor_T: pd.Series,
@@ -187,50 +185,61 @@ class ClassroomEnv:
         dt  = float(cfg.DT_SEC)
         V   = cfg.CLASS_AREA_M2 * cfg.CLASS_HEIGHT_M
 
+        # اعمال محدودیت (Clamp) روی اکشن تولید شده توسط هوش مصنوعی
+        vf_actual = float(np.clip(action, cfg.PI_VF_MIN, cfg.PI_VF_MAX))
+
         # ── Q mapping ──────────────────────────────
         occ_frac = min(self.occ[t] / max(cfg.PEOPLE_PER_OCC, 1), 1.0)
         spill    = cfg.NON_OCC_Q_SPILLOVER
-        Q = self.Q_base[t] * (1.0 + (action - 1.0) *
+        Q = self.Q_base[t] * (1.0 + (vf_actual - 1.0) *
                                (occ_frac + spill * (1.0 - occ_frac)))
         Q = float(np.clip(Q, 1e-9, cfg.VENT_RATE_MAX))
 
-        # ── CO2 mass-balance: عین simulate_co2_series ───────────
+        # ── CO2 mass-balance ───────────
         G_m3s  = self.occ[t] * cfg.CO2_GEN_LPS_PER_PERSON / 1000.0
         C_ss   = cfg.CO2_OUT_PPM + (G_m3s / Q) * 1e6
         alpha  = 1.0 - np.exp(-Q * dt / max(V, 1e-9))
         self.co2 = float(np.clip(
             self.co2 + alpha * (C_ss - self.co2), 350, cfg.CO2_CAP_PPM))
-        self.vf = action
+        
+        self.vf = vf_actual
 
-        reward = self._reward(action, Q, t)
+        reward = self._reward(vf_actual, Q, t)
         self.t += 1
         done    = (self.t >= self.n)
-        return self._state(), reward, done, {'co2': self.co2, 'Q': Q, 'vf': action}
-
+        return self._state(), reward, done, {'co2': self.co2, 'Q': Q, 'vf': vf_actual}
+    
     def _reward(self, vf: float, Q: float, t: int) -> float:
-        cfg   = self.cfg
-        # ── fan power law: عین compute_fan_kWh_from_Q ────────────
-        Q_ref    = max(cfg.BASELINE_VENT_RATE_M3S, 1e-9)
-        n_exp    = cfg.FAN_POWER_EXP
-        energy_penalty = (Q / Q_ref) ** n_exp          # مقیاس‌بندی cubic
+        cfg = self.cfg
+        
+        excess = max(0.0, self.co2 - self.target)
+        co2_penalty = (excess / 20.0) ** 2  
 
-        # ── CO2 violation penalty ─────────────────────────────────
-        excess      = max(0.0, self.co2 - self.target)
-        co2_penalty = (excess / 100.0) ** 2
+        Q_ref = max(cfg.BASELINE_VENT_RATE_M3S, 1e-9)
+        fan_power_proxy = (Q / Q_ref) ** (cfg.FAN_POWER_EXP + 1)
+        
+        delta_T = max(0.0, 20.0 - self.T_out[t])
+        heating_proxy = (Q / Q_ref) * (delta_T / 5.0)  
+        
+        energy_penalty = 1.0 * fan_power_proxy + 1.0 * heating_proxy
 
-        # ── bonus برای غیراشغال با تهویه کم ──────────────────────
-        unocc_bonus = 0.3 if (self.occ[t] <= 0 and vf < 1.1) else 0.0
-
-        return float(-0.5 * energy_penalty - 0.5 * co2_penalty + unocc_bonus)
-
-
+        # محاسبه پاداش خام
+        if self.occ[t] <= 0:
+            waste_penalty = 5.0 * (vf - cfg.PI_VF_MIN)
+            raw_reward = -waste_penalty - co2_penalty
+        else:
+            base_vf_penalty = 0.5 * vf 
+            raw_reward = -5.0 * energy_penalty - base_vf_penalty - 2.0 * co2_penalty
+            
+        # *** مقیاس‌بندی پاداش برای جلوگیری از انفجار گرادیان ***
+        return float(raw_reward / 100.0)
 # ============================================================
 # PPO Agent  (جدید - RL)
 # ============================================================
 class PPOAgent:
-    def __init__(self, state_dim: int = 7, lr: float = 3e-4,
+    def __init__(self, state_dim: int = 7, lr: float = 3e-4, # نرخ یادگیری بالاتر
                  gamma: float = 0.99, eps_clip: float = 0.2,
-                 k_epochs: int = 4, update_interval: int = 96):
+                 k_epochs: int = 5, update_interval: int = 2000): # آپدیت‌های منطقی‌تر
         self.gamma           = gamma
         self.eps_clip        = eps_clip
         self.k_epochs        = k_epochs
@@ -254,23 +263,25 @@ class PPOAgent:
         self._buf_lp.append(lp); self._buf_r.append(r)
         self._buf_d.append(done); self._buf_v.append(v)
 
-    def _returns(self) -> torch.Tensor:
-        R, rets = 0.0, []
+    def update(self, next_val: float) -> float:
+        if len(self._buf_s) < 2:
+            return 0.0
+            
+        # محاسبه صحیح پاداش‌های آینده (Bootstrapping)
+        R, rets = next_val, []
         for r, d in zip(reversed(self._buf_r), reversed(self._buf_d)):
             R = r + self.gamma * R * (1.0 - d)
             rets.insert(0, R)
-        t = torch.FloatTensor(rets)
-        return (t - t.mean()) / (t.std() + 1e-8)
+            
+        rets_t = torch.FloatTensor(rets)
+        rets_t = (rets_t - rets_t.mean()) / (rets_t.std() + 1e-8)
 
-    def update(self) -> float:
-        if len(self._buf_s) < 2:
-            return 0.0
         states  = torch.FloatTensor(np.array(self._buf_s))
         actions = torch.FloatTensor(self._buf_a).unsqueeze(-1)
         old_lp  = torch.FloatTensor(self._buf_lp)
-        rets    = self._returns()
         vals    = torch.FloatTensor(self._buf_v)
-        adv     = (rets - vals).detach()
+        
+        adv = (rets_t - vals).detach()
 
         total = 0.0
         for _ in range(self.k_epochs):
@@ -281,9 +292,10 @@ class PPOAgent:
             s1 = ratio * adv
             s2 = ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip) * adv
             a_loss = -torch.min(s1, s2).mean()
-            c_loss = nn.functional.mse_loss(val.squeeze(-1), rets)
+            c_loss = nn.functional.mse_loss(val.squeeze(-1), rets_t)
             ent    = dist.entropy().mean()
             loss   = a_loss + 0.5 * c_loss - 0.01 * ent
+            
             self.opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
@@ -307,8 +319,11 @@ class PPOAgent:
             co2_log.append(info['co2'])
             vf_log.append(info['vf'])
             step += 1
+            
             if step % self.update_interval == 0 or done:
-                loss = self.update()
+                _, _, next_v = self.select_action(next_s) if not done else (0, 0, 0.0)
+                loss = self.update(next_v)
+                
             state = next_s
             if done:
                 break
@@ -321,16 +336,19 @@ class PPOAgent:
         vf_out, co2_out = [], []
         with torch.no_grad():
             while True:
-                a, _, _ = self.select_action(state)
-                state, _, done, info = env.step(a)
+                # در زمان اینفرنس، به جای سمپلینگ تصادفی، مستقیماً از میانگین استفاده می‌کنیم
+                x = torch.FloatTensor(state).unsqueeze(0)
+                mean, _, _ = self.net(x)
+                action = mean.item() 
+                
+                state, _, done, info = env.step(action)
                 vf_out.append(info['vf'])
                 co2_out.append(info['co2'])
                 if done:
                     break
         self.net.train()
         return vf_out, co2_out
-
-
+    
 def train_rl_agent(env: ClassroomEnv, agent: PPOAgent,
                    n_episodes: int = 50) -> dict:
     history = {'episode': [], 'reward': [], 'avg_co2': [],
@@ -355,7 +373,7 @@ def train_rl_agent(env: ClassroomEnv, agent: PPOAgent,
 
 
 # ============================================================
-# Helper functions 
+# Helper functions  (عین کد مرجع - بدون تغییر)
 # ============================================================
 def load_and_preprocess_data(baseline_path: Path,
                               weather_path: Path = None,
@@ -461,7 +479,7 @@ def get_measured_co2(df: pd.DataFrame) -> Tuple[Optional[pd.Series], bool, str]:
 
 
 def _baseline_Q_to_series(baseline_Q, idx: pd.DatetimeIndex) -> pd.Series:
-    
+    """عین کد مرجع"""
     if np.isscalar(baseline_Q):
         return pd.Series(float(baseline_Q), index=idx, dtype=float)
     if isinstance(baseline_Q, pd.Series):
@@ -474,7 +492,7 @@ def _baseline_Q_to_series(baseline_Q, idx: pd.DatetimeIndex) -> pd.Series:
 
 
 def simulate_co2_series(baseline_Q, vent_factor, occ_people_series, config):
-   
+    """عین کد مرجع"""
     idx   = occ_people_series.index
     dt    = config.DT_SEC
     V     = config.CLASS_AREA_M2 * config.CLASS_HEIGHT_M
@@ -506,7 +524,7 @@ def simulate_co2_series(baseline_Q, vent_factor, occ_people_series, config):
 
 def simulate_pi_mass_balance(baseline_Q, occ_people_series, co2_target_ppm,
                               config: SystemConfig, C0_ppm=None):
-    
+    """عین کد مرجع"""
     idx    = occ_people_series.index
     bQ     = _baseline_Q_to_series(baseline_Q, idx)
     bQ_ref = float(np.nanmedian(bQ.values))
@@ -560,7 +578,7 @@ def simulate_pi_mass_balance(baseline_Q, occ_people_series, co2_target_ppm,
 
 def compute_Q_series_from_factor(baseline_Q, vent_factor, occ_people_series,
                                   config: SystemConfig) -> pd.Series:
-    
+    """عین کد مرجع"""
     occ_frac = (occ_people_series / max(config.PEOPLE_PER_OCC, 1)).clip(0, 1)
     spill    = float(getattr(config, "NON_OCC_Q_SPILLOVER", 0.20))
     bQ       = _baseline_Q_to_series(baseline_Q, occ_people_series.index)
@@ -576,7 +594,7 @@ def compute_Q_series_from_factor(baseline_Q, vent_factor, occ_people_series,
 def solve_vent_factor_for_target_exact(baseline_Q, occ_people, target_ppm,
                                        config, occ_mask,
                                        tol_ppm=1e-3, max_iter=120):
-    
+    """عین کد مرجع - برای PI"""
     bQ  = _baseline_Q_to_series(baseline_Q, occ_people.index)
     bQr = float(np.nanmedian(bQ.values))
     lo  = 0.001
@@ -603,7 +621,7 @@ def solve_vent_factor_for_target_exact(baseline_Q, occ_people, target_ppm,
 
 
 def calculate_tou_costs(df: pd.DataFrame, tou_config: TOUPricing) -> pd.DataFrame:
-    
+    """عین کد مرجع"""
     df = df.copy()
     elec_prices = np.array([tou_config.get_electricity_price(ts) for ts in df.index])
     heat_prices = np.array([tou_config.get_heating_price(ts) for ts in df.index])
@@ -625,6 +643,7 @@ def calculate_tou_costs(df: pd.DataFrame, tou_config: TOUPricing) -> pd.DataFram
 
 # ============================================================
 # Scenario: run_single_co2_scenario
+# فرمول‌های انرژی و مقیاس‌بندی عین کد مرجع
 # ============================================================
 def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
                              config: SystemConfig, args,
@@ -634,7 +653,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     print(f"{'='*70}")
     config.CO2_TARGET_PPM = co2_target_ppm
 
-    # ── result_index: (از sequence_length شروع میشه) ──
+    # ── result_index: عین کد مرجع (از sequence_length شروع میشه) ──
     # در کد مرجع: df.index[args.sequence_length : args.sequence_length + len(predictions)]
     # چون RL به sequence نیاز ندارد، از همان offset استفاده میکنیم
     # تا بازه زمانی دقیقاً یکی باشد و AsIs energy میانگین یکسانی بدهد
@@ -648,7 +667,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
                   if 'occupancy' in df.columns
                   else pd.Series(0.0, index=result_index))
 
-    # ── As-Is انرژی (اندازه‌گیری شده) ─────────────
+    # ── As-Is انرژی (اندازه‌گیری شده - عین کد مرجع) ─────────────
     asis_elec, asis_heat, have_measured_asis_energy = \
         get_measured_asis_energy(df, result_index)
     if not have_measured_asis_energy:
@@ -657,7 +676,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
         asis_heat = pd.Series(np.random.normal(0.8, 0.2, len(result_index)),
                               index=result_index)
 
-    # ── baseline Q  ──────────────────────────────────
+    # ── baseline Q (عین کد مرجع) ──────────────────────────────────
     if ('Q_room_m3s' in df.columns and
             pd.to_numeric(df['Q_room_m3s'], errors='coerce').notna().any()):
         baseline_Q_series = pd.to_numeric(
@@ -683,7 +702,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
         co2_win = co2_win.interpolate(method='time', limit=8, limit_area='inside')
 
         if baseline_Q_series is None:
-            # استنتاج از CO2 
+            # استنتاج از CO2 (عین کد مرجع)
             G_m3s      = (config.PEOPLE_PER_OCC *
                           config.CO2_GEN_LPS_PER_PERSON / 1000.0)
             asis_co2_avg = float(co2_win[occ_15].mean()) if occ_15.any() else 700.0
@@ -701,13 +720,13 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     if baseline_vent_rate is None:
         baseline_vent_rate = float(config.BASELINE_VENT_RATE_M3S)
 
-    # ── Q_ref برای fan model  ───────────────────────
+    # ── Q_ref برای fan model (عین کد مرجع) ───────────────────────
     Q_ref_fan = float(pd.to_numeric(baseline_Q_series, errors='coerce')[occ_15].median())
     if not np.isfinite(Q_ref_fan) or Q_ref_fan <= 0:
         Q_ref_fan = float(baseline_vent_rate)
     config.BASELINE_VENT_RATE_M3S = Q_ref_fan
 
-    # ── PI controller  ─────────────────────────────
+    # ── PI controller (عین کد مرجع) ─────────────────────────────
     C0_init = None
     if co2_win is not None:
         try:
@@ -725,7 +744,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     pi_vent_factor = float(pd.to_numeric(pi_vf_series, errors='coerce')[occ_15].mean())
     pi_Q           = float(pd.to_numeric(pi_Q_series,  errors='coerce')[occ_15].mean())
 
-    # ── AI vent factor با solve_vent_factor  ─
+    # ── AI vent factor با solve_vent_factor (عین کد مرجع - برای CO2 sim) ─
     ai_vent_factor_static, ai_co2_avg_static, ai_Q_static = \
         solve_vent_factor_for_target_exact(
             baseline_vent_rate, occ_people, co2_target_ppm, config, occ_15,
@@ -788,7 +807,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     df_results['AI_Q_m3s']       = compute_Q_series_from_factor(
         baseline_vent_rate, ai_vf_series, occ_people, config).values
 
-    # ── Fan electricity: Method A ( ratio از As-Is) ──
+    # ── Fan electricity: Method A (عین کد مرجع - ratio از As-Is) ──
     # P(Q) = P_ref * (Q/Q_ref)^n   →   Efan = Eref * (Q/Q_asis)^n
     n = float(getattr(config, "FAN_POWER_EXP", 3.0))
 
@@ -796,11 +815,11 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     Q_pi   = pd.to_numeric(df_results['PI_Q_m3s'],   errors='coerce').astype(float).clip(lower=1e-9)
     Q_ai   = pd.to_numeric(df_results['AI_Q_m3s'],   errors='coerce').astype(float).clip(lower=1e-9)
 
-    # کف منطقی 
+    # کف منطقی (عین کد مرجع)
     Q_floor   = 0.2 * Q_ref_fan
     Q_asis_safe = Q_asis.clip(lower=Q_floor)
 
-    # cap: PI/AI نمی‌توانند بیشتر از AsIs باشند
+    # cap: PI/AI نمی‌توانند بیشتر از AsIs باشند (عین کد مرجع)
     Q_pi = np.minimum(Q_pi, Q_asis)
     Q_ai = np.minimum(Q_ai, Q_asis)
 
@@ -814,13 +833,13 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     df_results['PI_fan_kWh']   = Eref * (ratio_pi.values ** n)
     df_results['AI_fan_kWh']   = Eref * (ratio_ai.values ** n)
 
-    # hard cap: PI/AI نمی‌توانند از AsIs بیشتر شوند 
+    # hard cap: PI/AI نمی‌توانند از AsIs بیشتر شوند (عین کد مرجع)
     df_results['PI_fan_kWh'] = np.minimum(df_results['PI_fan_kWh'],
                                            df_results['AsIs_fan_kWh'])
     df_results['AI_fan_kWh'] = np.minimum(df_results['AI_fan_kWh'],
                                            df_results['AsIs_fan_kWh'])
 
-    # electricity = fan electricity 
+    # electricity = fan electricity (عین کد مرجع)
     df_results['PI_electricity_kWh'] = df_results['PI_fan_kWh']
     df_results['AI_electricity_kWh'] = df_results['AI_fan_kWh']
 
@@ -828,15 +847,15 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     df_results['PI_heating_kWh'] = asis_heat.values.copy()
     df_results['AI_heating_kWh'] = asis_heat.values.copy()
 
-    # ── Bind CO2 → Heating ─────────────────────────
+    # ── Bind CO2 → Heating (عین کد مرجع) ─────────────────────────
     if config.BIND_CO2_TO_ENERGY:
         occ_vec = occ_15.astype(float).values
         HVSHARE = float(getattr(config, 'HEATING_VENT_SHARE', 1.0))
 
-        # PI: از vf_series
+        # PI: از vf_series (عین کد مرجع: scale_PI_q = pi_vent_factor series)
         scale_PI_q = df_results['PI_vent_factor'].values if 'PI_vent_factor' in df_results.columns \
                      else pi_vent_factor
-        # AI: vent_factor میانگین 
+        # AI: vent_factor میانگین (عین کد مرجع)
         scale_AI_q = ai_vf_series.values
 
         df_results['AI_heating_kWh'] *= (
@@ -844,7 +863,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
         df_results['PI_heating_kWh'] *= (
             (1.0 - HVSHARE) + HVSHARE * (1.0 + (scale_PI_q - 1.0) * occ_vec))
 
-    # ── Daily aggregation و metrics ────────────────
+    # ── Daily aggregation و metrics (عین کد مرجع) ────────────────
     daily_results = df_results.resample('D').sum()
     occ_mask      = occupied_days.reindex(daily_results.index, fill_value=False)
 
@@ -872,7 +891,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
     pi_co2_peak   = float(pd.to_numeric(df_results['PI_CO2_ppm'],  errors='coerce')[occ_15].max())
     ai_co2_peak   = float(pd.Series(ai_co2_arr, index=result_index)[occ_15].max())
 
-    # ── TOU costs  ────────────────
+    # ── TOU costs (عین کد مرجع - فقط electricity) ────────────────
     tou_config = TOUPricing()
     df_costs   = calculate_tou_costs(df_results, tou_config)
     daily_costs= df_costs.resample('D').sum()
@@ -916,7 +935,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
 
 
 # ============================================================
-# Plot functions 
+# Plot functions  (عین کد مرجع)
 # ============================================================
 def create_rl_learning_curves(history: dict, out_dir: Path, co2_target: float = None):
     fig, axes = plt.subplots(2, 2, figsize=(14, 8))
@@ -964,6 +983,7 @@ def create_lstm_comparison_plots_for_scenario(result: Dict, scenario_dir: Path,
     asis_co2p = result['co2_achieved_ppm']['asis_peak']
     ai_sav    = result['savings_pct']['ai']
 
+    # -- نمودار ۱: bar (فقط AsIs و RL) --
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     sc  = ['AsIs', 'RL']
     col = ['#1f77b4', '#2ca02c']
@@ -977,6 +997,7 @@ def create_lstm_comparison_plots_for_scenario(result: Dict, scenario_dir: Path,
     ax1.set_title(f'Average Daily Electricity - CO₂={int(co2_target)}ppm', fontweight='bold')
     ax1.set_ylim(0, max(asis_mean, ai_mean)*1.25)
 
+    # نمودار savings: مقایسه واقعی با hatch و فلش
     bars2 = ax2.bar(x, [asis_mean, ai_mean], color=col, alpha=0.85, width=0.5,
                     edgecolor='white', linewidth=1.2)
     ax2.bar(x[0], asis_mean - ai_mean, bottom=ai_mean,
@@ -1004,6 +1025,7 @@ def create_lstm_comparison_plots_for_scenario(result: Dict, scenario_dir: Path,
     plt.savefig(f1, dpi=150, bbox_inches='tight'); plt.close(fig)
     print(f"  ✅ Saved: {f1.name}")
 
+    # -- نمودار ۲: daily timeseries (فقط AsIs و RL) --
     fig2, ax = plt.subplots(figsize=(15, 6))
     ax.plot(daily_results.index, daily_results['AsIs_electricity_kWh'],
             label=f'AsIs (avg: {asis_mean:.2f} kWh)', color='#1f77b4', lw=1.5, alpha=0.8)
@@ -1031,6 +1053,7 @@ def create_lstm_comparison_plots_for_scenario(result: Dict, scenario_dir: Path,
     plt.savefig(f2, dpi=150, bbox_inches='tight'); plt.close(fig2)
     print(f"  ✅ Saved: {f2.name}")
 
+    # -- نمودار ۳: CO2 (7 روز، فقط AsIs و RL) --
     fig3, (a1, a2) = plt.subplots(2, 1, figsize=(15, 8),
                                    gridspec_kw={'height_ratios': [3,1], 'hspace': 0.05})
     sl = slice(0, min(7*96, len(df_results)))
@@ -1059,6 +1082,7 @@ def create_lstm_comparison_plots_for_scenario(result: Dict, scenario_dir: Path,
     plt.savefig(f3, dpi=150, bbox_inches='tight'); plt.close(fig3)
     print(f"  ✅ Saved: {f3.name}")
 
+    # -- نمودار ۴: full timeseries (فقط AsIs و RL) --
     fig4, ax4 = plt.subplots(figsize=(24, 4))
     ax4.plot(df_results.index, df_results['AsIs_CO2_ppm'],
              label='As-Is (measured)', lw=0.8, color='#1f77b4')
@@ -1161,6 +1185,7 @@ def create_tou_cost_plots_for_scenario(result: Dict, scenario_dir: Path,
 
 
 def create_co2_sweep_plots(sweep_results: List[Dict], out_dir: Path):
+    """عین کد مرجع"""
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     co2_t = [r['co2_target'] for r in sweep_results]
     ai_e  = [r['electricity_kwh_day']['ai'] for r in sweep_results]
@@ -1277,6 +1302,7 @@ def create_violation_metrics_plot(sweep_results: List[Dict], out_dir: Path):
 
 
 def _plot_optimization_3d_from_results(sweep_results: List[Dict], out_dir):
+    """عین کد مرجع"""
     rows = []
     for r in sweep_results:
         df  = r['df_results']; idx = df.index
@@ -1336,7 +1362,7 @@ def main():
     parser.add_argument('--weather_file',        type=str, default=None)
     parser.add_argument('--qproxy_xlsx',         type=str, default=default_qp)
     parser.add_argument('--out_dir',             type=str, default=default_out)
-    parser.add_argument('--epochs',              type=int, default=50)
+    parser.add_argument('--epochs',              type=int, default=300)
     parser.add_argument('--sequence_length',     type=int, default=48,
                         help='Offset از ابتدای داده - عین کد مرجع')
     parser.add_argument('--co2_min',             type=int, default=900)
@@ -1362,6 +1388,7 @@ def main():
     print(f"\n🔍 Output: {out_dir.absolute()}")
     print(f"   Writable: {os.access(out_dir, os.W_OK)}")
 
+    # تست نوشتن
     tf = out_dir/'_test.txt'
     try:
         tf.write_text('test'); tf.unlink(); print("   ✅ Write test OK")
@@ -1459,6 +1486,7 @@ def main():
             'AI_VF':        r['ventilation']['ai_factor'],
         } for r in sweep_results]).to_excel(writer, sheet_name='CO2_Metrics', index=False)
 
+    # JSON
     with open(out_dir/'rl_sweep_results.json', 'w') as f:
         json.dump({
             'metadata': {
@@ -1477,6 +1505,7 @@ def main():
             } for r in sweep_results]
         }, f, indent=2)
 
+    # خلاصه نهایی
     best = max(sweep_results, key=lambda x: x['savings_pct']['ai'])
     print("\n" + "="*80)
     print("✅  PPO-RL CO₂ Sweep Complete")
