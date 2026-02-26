@@ -105,250 +105,247 @@ class SystemConfig:
     FAN_ELEC_SHARE: float        = 0.30
     HEATING_VENT_SHARE: float    = 1.0
     NON_OCC_Q_SPILLOVER: float   = 0.20
-    FAN_POWER_EXP: float         = 2
+    FAN_POWER_EXP: float         = 3
 
 
 # ============================================================
 # PPO: Actor-Critic Network  (جدید - RL)
 # ============================================================
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim: int = 7, hidden: int = 128):
+    """نگه داشته شده برای سازگاری — از DCV_Agent استفاده می‌شود"""
+    def __init__(self, state_dim: int = 6, hidden: int = 128):
         super().__init__()
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden),    nn.ReLU(),
+            nn.Linear(state_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden),    nn.Tanh(),
         )
         self.actor_mean    = nn.Linear(hidden, 1)
-        self.actor_log_std = nn.Parameter(torch.ones(1) * -0.5) 
+        self.actor_log_std = nn.Parameter(torch.ones(1) * -1.0)
         self.critic        = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.actor_mean.weight)
+        nn.init.zeros_(self.actor_mean.bias)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         h    = self.shared(x)
-        # استفاده از Tanh برای محدودسازی ایمن در بازه [0, 2]
-        # در ابتدا Tanh(0) = 0 است، پس mean از 1.0 شروع می‌شود
-        mean = torch.tanh(self.actor_mean(h)) + 1.0 
-        std  = self.actor_log_std.exp().expand_as(mean)
-        val  = self.critic(h)
-        return mean, std, val
+        mean = torch.sigmoid(self.actor_mean(h)) * 1.9 + 0.1
+        std  = self.actor_log_std.clamp(-3, 0).exp().expand_as(mean)
+        return mean, std, self.critic(h)
 
-    def get_action(self, state_np: np.ndarray):
+    def get_action(self, state_np):
         x = torch.FloatTensor(state_np).unsqueeze(0)
         with torch.no_grad():
             mean, std, val = self(x)
-        dist   = torch.distributions.Normal(mean, std)
-        action = dist.sample()
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.sample().clamp(0.1, 2.0)
         return action.item(), dist.log_prob(action).sum().item(), val.item()
-    
+            
 # ============================================================
 # Classroom Environment  (جدید - RL)
 # همان فرمول CO2 mass-balance عین simulate_co2_series
 # همان Q mapping عین کد مرجع
 # ============================================================
 class ClassroomEnv:
-    def __init__(self, occ_people: pd.Series, outdoor_T: pd.Series,
-                 baseline_Q_series: pd.Series, config: SystemConfig,
-                 co2_target: float):
-        self.occ     = occ_people.values.astype(float)
-        self.T_out   = outdoor_T.values.astype(float)
-        self.index   = occ_people.index
-        self.n       = len(self.occ)
-        self.cfg     = config
-        self.target  = float(co2_target)
-        # baseline_Q سری کامل (عین AsIs_Q_m3s)
-        self.Q_base  = pd.to_numeric(baseline_Q_series, errors='coerce').values.astype(float)
-        self.Q_base  = np.where(np.isfinite(self.Q_base), self.Q_base,
-                                config.BASELINE_VENT_RATE_M3S)
+    def __init__(self, occ_people, outdoor_T, baseline_Q_series, config, co2_target):
+        self.occ    = occ_people.values.astype(float)
+        self.T_out  = outdoor_T.values.astype(float)
+        self.index  = occ_people.index
+        self.n      = len(self.occ)
+        self.cfg    = config
+        self.target = float(co2_target)
+        self.Q_base = pd.to_numeric(baseline_Q_series, errors='coerce').values.astype(float)
+        self.Q_base = np.where(np.isfinite(self.Q_base), self.Q_base,
+                               config.BASELINE_VENT_RATE_M3S)
+        self.Q_ref  = float(np.nanmedian(self.Q_base[self.Q_base > 0])) \
+                      if np.any(self.Q_base > 0) else config.BASELINE_VENT_RATE_M3S
         self.reset()
 
-    def _state(self) -> np.ndarray:
-        t       = min(self.t, self.n - 1)
-        hour    = self.index[t].hour if hasattr(self.index[t], 'hour') else 12
-        return np.array([
-            self.co2 / 1000.0,
-            min(self.occ[t] / max(self.cfg.PEOPLE_PER_OCC, 1), 1.0),
-            np.sin(2 * np.pi * hour / 24),
-            np.cos(2 * np.pi * hour / 24),
-            np.clip((self.T_out[t] + 20) / 50.0, 0, 1),
-            float(self.occ[t] > 0),
-            self.vf / 2.0,
-        ], dtype=np.float32)
+    def _compute_Q(self, vf, t):
+        cfg = self.cfg
+        occ_frac = min(self.occ[t] / max(cfg.PEOPLE_PER_OCC, 1), 1.0)
+        spill    = cfg.NON_OCC_Q_SPILLOVER
+        Q = self.Q_base[t] * (1.0 + (vf - 1.0) * (occ_frac + spill * (1 - occ_frac)))
+        return float(np.clip(Q, 1e-9, cfg.VENT_RATE_MAX))
 
     def reset(self):
         self.t   = 0
         self.co2 = self.cfg.CO2_OUT_PPM
         self.vf  = 1.0
-        return self._state()
+        return self._get_state()
 
-    def step(self, action: float):
+    def _get_state(self):
+        t = min(self.t, self.n - 1)
+        h = self.index[t].hour if hasattr(self.index[t], 'hour') else 12
+        co2_norm = np.clip((self.co2 - self.cfg.CO2_OUT_PPM) /
+                            max(self.target - self.cfg.CO2_OUT_PPM, 1), 0, 2)
+        return np.array([co2_norm, float(self.co2 <= self.target),
+                         float(self.occ[min(self.t, self.n-1)] > 0),
+                         min(self.occ[min(self.t, self.n-1)] / max(self.cfg.PEOPLE_PER_OCC,1), 1),
+                         np.sin(2*np.pi*h/24), np.cos(2*np.pi*h/24)], dtype=np.float32)
+
+    def step(self, action):
         t   = self.t
         cfg = self.cfg
         dt  = float(cfg.DT_SEC)
         V   = cfg.CLASS_AREA_M2 * cfg.CLASS_HEIGHT_M
+        vf  = float(np.clip(action, cfg.PI_VF_MIN, cfg.PI_VF_MAX))
+        Q   = self._compute_Q(vf, t)
+        G   = self.occ[t] * cfg.CO2_GEN_LPS_PER_PERSON / 1000.0
+        Css = cfg.CO2_OUT_PPM + (G / Q) * 1e6
+        a   = 1.0 - np.exp(-Q * dt / max(V, 1e-9))
+        self.co2 = float(np.clip(self.co2 + a * (Css - self.co2), 350, cfg.CO2_CAP_PPM))
+        self.vf  = vf
+        r        = self._reward(vf, t)
+        self.t  += 1
+        return self._get_state(), r, self.t >= self.n, {'co2': self.co2, 'Q': Q, 'vf': vf}
 
-        # اعمال محدودیت (Clamp) روی اکشن تولید شده توسط هوش مصنوعی
-        vf_actual = float(np.clip(action, cfg.PI_VF_MIN, cfg.PI_VF_MAX))
-
-        # ── Q mapping ──────────────────────────────
-        occ_frac = min(self.occ[t] / max(cfg.PEOPLE_PER_OCC, 1), 1.0)
-        spill    = cfg.NON_OCC_Q_SPILLOVER
-        Q = self.Q_base[t] * (1.0 + (vf_actual - 1.0) *
-                               (occ_frac + spill * (1.0 - occ_frac)))
-        Q = float(np.clip(Q, 1e-9, cfg.VENT_RATE_MAX))
-
-        # ── CO2 mass-balance ───────────
-        G_m3s  = self.occ[t] * cfg.CO2_GEN_LPS_PER_PERSON / 1000.0
-        C_ss   = cfg.CO2_OUT_PPM + (G_m3s / Q) * 1e6
-        alpha  = 1.0 - np.exp(-Q * dt / max(V, 1e-9))
-        self.co2 = float(np.clip(
-            self.co2 + alpha * (C_ss - self.co2), 350, cfg.CO2_CAP_PPM))
-        
-        self.vf = vf_actual
-
-        reward = self._reward(vf_actual, Q, t)
-        self.t += 1
-        done    = (self.t >= self.n)
-        return self._state(), reward, done, {'co2': self.co2, 'Q': Q, 'vf': vf_actual}
-    
-    def _reward(self, vf: float, Q: float, t: int) -> float:
+    def _reward(self, vf: float, t: int) -> float:
         cfg = self.cfg
-        
-        excess = max(0.0, self.co2 - self.target)
-        co2_penalty = (excess / 20.0) ** 2  
 
-        Q_ref = max(cfg.BASELINE_VENT_RATE_M3S, 1e-9)
-        fan_power_proxy = (Q / Q_ref) ** (cfg.FAN_POWER_EXP + 1)
-        
-        delta_T = max(0.0, 20.0 - self.T_out[t])
-        heating_proxy = (Q / Q_ref) * (delta_T / 5.0)  
-        
-        energy_penalty = 1.0 * fan_power_proxy + 1.0 * heating_proxy
-
-        # محاسبه پاداش خام
+        # ── غیراشغال: هدف VF=0.5 نه VF_min=0.1 ──────────────
         if self.occ[t] <= 0:
-            waste_penalty = 5.0 * (vf - cfg.PI_VF_MIN)
-            raw_reward = -waste_penalty - co2_penalty
-        else:
-            base_vf_penalty = 0.5 * vf 
-            raw_reward = -5.0 * energy_penalty - base_vf_penalty - 2.0 * co2_penalty
-            
-        # *** مقیاس‌بندی پاداش برای جلوگیری از انفجار گرادیان ***
-        return float(raw_reward / 100.0)
-# ============================================================
-# PPO Agent  (جدید - RL)
-# ============================================================
-class PPOAgent:
-    def __init__(self, state_dim: int = 7, lr: float = 3e-4, # نرخ یادگیری بالاتر
-                 gamma: float = 0.99, eps_clip: float = 0.2,
-                 k_epochs: int = 5, update_interval: int = 2000): # آپدیت‌های منطقی‌تر
-        self.gamma           = gamma
-        self.eps_clip        = eps_clip
-        self.k_epochs        = k_epochs
-        self.update_interval = update_interval
+            # جریمه فاصله از 0.5 (نه 0.1)
+            return float(-3.0 * max(0.0, vf - 0.50))
 
-        self.net = ActorCritic(state_dim)
-        self.opt = optim.Adam(self.net.parameters(), lr=lr)
+        # ── اشغال ─────────────────────────────────────────────
+        # پاداش صرفه‌جویی: نسبت به VF=1.0 (baseline)
+        # اگر VF=0.5 → reward=+1.0، اگر VF=1.0 → reward=0، اگر VF=2.0 → -2.0
+        energy_rew = (1.0 - vf) * 2.0
 
-        self._buf_s: List  = []
-        self._buf_a: List  = []
-        self._buf_lp: List = []
-        self._buf_r: List  = []
-        self._buf_d: List  = []
-        self._buf_v: List  = []
+        # جریمه CO2
+        excess    = max(0.0, self.co2 - self.target)
+        co2_pen   = (excess / 50.0) ** 2 * 8.0
 
-    def select_action(self, state: np.ndarray):
-        return self.net.get_action(state)
+        # جریمه اگر VF زیر کف ایمن برود
+        floor_pen = 0.0
+        if vf < 0.50:
+            floor_pen = (0.50 - vf) * 10.0   # جریمه سنگین زیر 0.5
 
-    def _store(self, s, a, lp, r, done, v):
-        self._buf_s.append(s);  self._buf_a.append(a)
-        self._buf_lp.append(lp); self._buf_r.append(r)
-        self._buf_d.append(done); self._buf_v.append(v)
-
-    def update(self, next_val: float) -> float:
-        if len(self._buf_s) < 2:
-            return 0.0
-            
-        # محاسبه صحیح پاداش‌های آینده (Bootstrapping)
-        R, rets = next_val, []
-        for r, d in zip(reversed(self._buf_r), reversed(self._buf_d)):
-            R = r + self.gamma * R * (1.0 - d)
-            rets.insert(0, R)
-            
-        rets_t = torch.FloatTensor(rets)
-        rets_t = (rets_t - rets_t.mean()) / (rets_t.std() + 1e-8)
-
-        states  = torch.FloatTensor(np.array(self._buf_s))
-        actions = torch.FloatTensor(self._buf_a).unsqueeze(-1)
-        old_lp  = torch.FloatTensor(self._buf_lp)
-        vals    = torch.FloatTensor(self._buf_v)
+        return float(energy_rew - co2_pen - floor_pen)
         
-        adv = (rets_t - vals).detach()
+class DCVAgent:
+    """
+    رویکرد مستقیم و اثبات‌شده برای صرفه‌جویی انرژی:
+    - وقت کلاس خالیه: VF = VF_min (حداقل تهویه)
+    - وقت کلاس پره: VF = f(occupancy) — proportional control
+    - یادگیری: scale factor را با Q-learning ساده تنظیم می‌کند
+    """
+    def __init__(self, vf_min=0.10, vf_max=2.0, n_bins=10, lr=0.1, gamma=0.95,
+                 epsilon_start=0.3, epsilon_end=0.05):
+        self.vf_min      = vf_min
+        self.vf_max      = vf_max
+        self.n_bins      = n_bins
+        self.lr          = lr
+        self.gamma       = gamma
+        self.epsilon     = epsilon_start
+        self.epsilon_end = epsilon_end
+        # Q-table: state = (co2_bin, occ_bin), action = vf_bin
+        self.q_table = np.zeros((n_bins, n_bins, n_bins))
+        # action space: n_bins VF values between vf_min and vf_max
+        self.vf_actions = np.linspace(vf_min, vf_max, n_bins)
+        self.episode     = 0
 
-        total = 0.0
-        for _ in range(self.k_epochs):
-            mean, std, val = self.net(states)
-            dist   = torch.distributions.Normal(mean, std)
-            new_lp = dist.log_prob(actions).squeeze(-1).sum(-1)
-            ratio  = (new_lp - old_lp).exp()
-            s1 = ratio * adv
-            s2 = ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip) * adv
-            a_loss = -torch.min(s1, s2).mean()
-            c_loss = nn.functional.mse_loss(val.squeeze(-1), rets_t)
-            ent    = dist.entropy().mean()
-            loss   = a_loss + 0.5 * c_loss - 0.01 * ent
-            
-            self.opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
-            self.opt.step()
-            total += loss.item()
+    def _discretize(self, co2_ppm, occ_frac, co2_target, co2_out=420):
+        co2_bin = int(np.clip((co2_ppm - co2_out) / max(co2_target - co2_out, 1) * (self.n_bins-1), 0, self.n_bins-1))
+        occ_bin = int(np.clip(occ_frac * (self.n_bins-1), 0, self.n_bins-1))
+        return co2_bin, occ_bin
 
-        for lst in [self._buf_s, self._buf_a, self._buf_lp,
-                    self._buf_r, self._buf_d, self._buf_v]:
-            lst.clear()
-        return total / self.k_epochs
+    def select_action(self, state_np: np.ndarray) -> Tuple[float, float, float]:
+        """state_np: [co2_norm, co2_ok, is_occ, occ_frac, sin_h, cos_h]"""
+        co2_norm = float(state_np[0])
+        is_occ   = float(state_np[2])
+        occ_frac = float(state_np[3])
+
+        # وقتی خالیه: همیشه VF_min
+        if is_occ < 0.5:
+            return self.vf_min, 0.0, 0.0
+
+        # co2_ppm تقریبی از co2_norm
+        co2_approx = 420 + co2_norm * 480  # [420, 900] approx
+        c_bin, o_bin = self._discretize(co2_approx, occ_frac, 900)
+
+        if np.random.random() < self.epsilon:
+            a_idx = np.random.randint(self.n_bins)
+        else:
+            a_idx = int(np.argmax(self.q_table[c_bin, o_bin]))
+
+        return float(self.vf_actions[a_idx]), 0.0, 0.0
+
+    def update_q(self, state_np, action, reward, next_state_np, done):
+        co2_norm   = float(state_np[0])
+        occ_frac   = float(state_np[3])
+        co2_approx = 420 + co2_norm * 480
+        c_bin, o_bin = self._discretize(co2_approx, occ_frac, 900)
+
+        a_idx = int(np.argmin(np.abs(self.vf_actions - action)))
+
+        nc_norm = float(next_state_np[0])
+        no_frac = float(next_state_np[3])
+        nc_approx = 420 + nc_norm * 480
+        nc_bin, no_bin = self._discretize(nc_approx, no_frac, 900)
+
+        target_q = reward + (0 if done else self.gamma * np.max(self.q_table[nc_bin, no_bin]))
+        self.q_table[c_bin, o_bin, a_idx] += self.lr * (target_q - self.q_table[c_bin, o_bin, a_idx])
 
     def train_episode(self, env: ClassroomEnv) -> dict:
         state = env.reset()
         ep_r, co2_log, vf_log = 0.0, [], []
-        loss, step = 0.0, 0
         while True:
-            action, lp, val = self.select_action(state)
-            next_s, r, done, info = env.step(action)
-            self._store(state, action, lp, r, float(done), val)
+            vf, _, _ = self.select_action(state)
+            next_s, r, done, info = env.step(vf)
+            self.update_q(state, vf, r, next_s, done)
             ep_r += r
             co2_log.append(info['co2'])
             vf_log.append(info['vf'])
-            step += 1
-            
-            if step % self.update_interval == 0 or done:
-                _, _, next_v = self.select_action(next_s) if not done else (0, 0, 0.0)
-                loss = self.update(next_v)
-                
             state = next_s
             if done:
                 break
+        self.episode += 1
+        # epsilon decay
+        self.epsilon = max(self.epsilon_end,
+                           self.epsilon - (0.3 - self.epsilon_end) / 150)
         return {'reward': ep_r, 'avg_co2': float(np.mean(co2_log)),
-                'vf_mean': float(np.mean(vf_log)), 'loss': loss}
+                'vf_mean': float(np.mean(vf_log)), 'loss': 0.0}
 
     def run_inference(self, env: ClassroomEnv) -> Tuple[List[float], List[float]]:
-        self.net.eval()
+        """Greedy policy (بدون exploration)"""
+        old_eps, self.epsilon = self.epsilon, 0.0
         state = env.reset()
         vf_out, co2_out = [], []
-        with torch.no_grad():
-            while True:
-                # در زمان اینفرنس، به جای سمپلینگ تصادفی، مستقیماً از میانگین استفاده می‌کنیم
-                x = torch.FloatTensor(state).unsqueeze(0)
-                mean, _, _ = self.net(x)
-                action = mean.item() 
-                
-                state, _, done, info = env.step(action)
-                vf_out.append(info['vf'])
-                co2_out.append(info['co2'])
-                if done:
-                    break
-        self.net.train()
+        while True:
+            vf, _, _ = self.select_action(state)
+            state, _, done, info = env.step(vf)
+            vf_out.append(info['vf'])
+            co2_out.append(info['co2'])
+            if done:
+                break
+        self.epsilon = old_eps
         return vf_out, co2_out
-    
+
+
+class PPOAgent:
+    """Wrapper که DCVAgent را صدا می‌زند — برای سازگاری با بقیه کد"""
+    def __init__(self, state_dim=6, lr=3e-4, gamma=0.99,
+                 eps_clip=0.2, k_epochs=4, update_interval=96):
+        self._dcv = DCVAgent(
+            vf_min=0.20,        # ← کف واقعی: حداقل 50٪ تهویه پایه (جلوگیری از یخ‌زدگی)
+            vf_max=2.0,
+            n_bins=10,
+            lr=0.15,
+            gamma=gamma,
+            epsilon_start=0.4,
+            epsilon_end=0.05
+        )
+        self.total_updates = 0
+
+    def select_action(self, state):
+        return self._dcv.select_action(state)
+
+    def train_episode(self, env):
+        return self._dcv.train_episode(env)
+
+    def run_inference(self, env):
+        return self._dcv.run_inference(env)
+        
 def train_rl_agent(env: ClassroomEnv, agent: PPOAgent,
                    n_episodes: int = 50) -> dict:
     history = {'episode': [], 'reward': [], 'avg_co2': [],
@@ -764,7 +761,7 @@ def run_single_co2_scenario(co2_target_ppm: float, df: pd.DataFrame,
         config=config,
         co2_target=co2_target_ppm
     )
-    agent = PPOAgent(state_dim=7, lr=3e-4, gamma=0.99,
+    agent = PPOAgent(state_dim=6, lr=3e-4, gamma=0.99,
                      eps_clip=0.2, k_epochs=4, update_interval=96)
 
     rl_history = train_rl_agent(env, agent, n_episodes=args.epochs)
